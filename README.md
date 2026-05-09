@@ -74,6 +74,12 @@ python-dotenv>=1.0.0
 ```
 
 ### 2. Set up your `.env`
+```bash
+cp .env.example .env
+
+nano .env
+```
+
 
 ```env
 # Telegram
