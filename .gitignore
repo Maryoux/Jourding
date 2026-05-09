@@ -1,0 +1,5 @@
+.env
+Jurding.zip
+__pycache__/
+*.pyc
+.ropeproject/
