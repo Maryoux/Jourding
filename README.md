@@ -45,7 +45,7 @@ Result: Win / Loss / Break Even
 ## Project structure
 
 ```
-trading_journal_bot/
+Jourding/
 ├── main.py                # Entry point — starts the bot
 ├── handlers.py            # All Telegram conversation handlers
 ├── notion_client.py       # Notion API wrapper
@@ -228,10 +228,10 @@ Description=Trading Journal Bot
 After=network.target
 
 [Service]
-WorkingDirectory=/path/to/trading_journal_bot
+WorkingDirectory=/path/to/Jourding
 ExecStart=/usr/bin/python3 main.py
 Restart=always
-EnvironmentFile=/path/to/trading_journal_bot/.env
+EnvironmentFile=/path/to/Jourding/.env
 
 [Install]
 WantedBy=multi-user.target
