@@ -1,4 +1,4 @@
-# 📒 Trading Journal Bot
+# Jourding
 
 A Telegram bot that logs your trades into Notion using a screenshot-first, button-driven flow. No typing required — just drop a chart and tap buttons.
 
