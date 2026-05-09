@@ -1,4 +1,4 @@
-# Jourding 🐍
+# Jourding
 
 Pure Python Telegram bot that logs trades directly to Notion.
 No n8n. No Zapier. No third-party automation layers.
