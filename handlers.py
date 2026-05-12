@@ -1,13 +1,17 @@
 """
-handlers_v3.py
-──────────────
-Key changes vs v2:
-  - Setup is multi-select — tap multiple, tap ✅ Done to confirm
-  - Custom setup saved to custom_setups.json, auto-appears as button next time
-  - SL / TP properly collected and pushed to Notion
-  - After flow: NO exit price input — auto-filled from result (Win=TP, Loss=SL, BE=Entry)
-  - Stats show RR instead of PnL
-  - "Message can't be edited" fully fixed — bot always edits its OWN messages only
+handlers.py
+───────────
+Key additions vs previous version:
+  - chart_reader integration: after a Before photo is received, Claude vision
+    automatically detects Entry, SL, and TP from the chart.
+  - New CONFIRM_PRICES state: shows detected levels with three options:
+      ✅ Use these  →  skips manual entry, saves immediately
+      ✏️ Edit       →  proceeds to the normal manual entry flow (pre-filled)
+      ⏭️ Skip all   →  saves with no prices (original "skip everything" path)
+  - If ANTHROPIC_API_KEY is not set, chart_reader is bypassed and the
+    original manual flow runs unchanged.
+  - All existing behaviour (multi-select setups, custom setups, After flow,
+    /stats, /open, /cancel) is preserved exactly.
 """
 
 import json
@@ -22,6 +26,13 @@ from telegram.ext import (
 
 import config
 import notion_client as notion
+
+# Import chart_reader only if the API key is available
+try:
+    import chart_reader as cr
+    _CHART_READER_AVAILABLE = bool(config.OPENROUTER_API_KEY)
+except ImportError:
+    _CHART_READER_AVAILABLE = False
 
 log = logging.getLogger(__name__)
 
@@ -50,9 +61,10 @@ def save_custom(name: str):
     PAIR, DIRECTION, SESSION,
     SETUP_PICK, CUSTOM_SETUP,
     EMOTION, GRADE,
+    CONFIRM_PRICES,             # ← NEW: auto-detected price confirmation
     ENTRY_PRICE, SL_PRICE, TP_PRICE,
     PICK_TRADE, RESULT,
-) = range(13)
+) = range(14)
 
 # ── Options ───────────────────────────────────────────────────────────────────
 PAIRS = [
@@ -73,7 +85,8 @@ EMOTIONS   = [
 ]
 GRADES  = [["A - Perfect", "B - Good", "C - Messy", "Skip"]]
 RESULTS = [["Win", "Loss", "Break Even"]]
-BASE_SETUPS = ["SMT", "IRL-ERL", "ERL-IRL", "Breakout", "Retest", "Reversal", "Trend", "Range", "News"]
+BASE_SETUPS = ["SMT", "IRL-ERL", "ERL-IRL", "Breakout", "Retest",
+               "Reversal", "Trend", "Range", "News"]
 
 EMOJIS = {
     "Long": "📈", "Short": "📉",
@@ -96,17 +109,14 @@ def kb(options: list[list[str]], prefix: str) -> InlineKeyboardMarkup:
     ])
 
 def skip_kb(prefix: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("Skip ⏭️", callback_data=f"{prefix}:skip")]])
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("Skip ⏭️", callback_data=f"{prefix}:skip")
+    ]])
 
 def val(cb: str) -> str:
     return cb.split(":", 1)[1]
 
 def setup_kb(selected: list[str]) -> InlineKeyboardMarkup:
-    """
-    Multi-select setup keyboard.
-    Selected items show a ✓ prefix.
-    Last row: ✏️ Type my own  |  ✅ Done
-    """
     all_setups = BASE_SETUPS + [s for s in load_custom() if s not in BASE_SETUPS]
     rows = []
     pair = []
@@ -138,6 +148,13 @@ def authorized(update: Update) -> bool:
     if config.ALLOWED_USER_ID == 0: return True
     return update.effective_user.id == config.ALLOWED_USER_ID
 
+# ── Price formatting helper ───────────────────────────────────────────────────
+def _fmt_price(v) -> str:
+    if v is None:
+        return "—"
+    v = float(v)
+    return f"{v:.2f}" if v >= 100 else f"{v:.5f}".rstrip("0").rstrip(".")
+
 # ══════════════════════════════════════════════════════════════════════════════
 # STEP 0 — Photo received
 # ══════════════════════════════════════════════════════════════════════════════
@@ -164,7 +181,7 @@ async def receive_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     return PHOTO_TYPE
 
 # ══════════════════════════════════════════════════════════════════════════════
-# BEFORE FLOW
+# PHOTO TYPE BRANCH
 # ══════════════════════════════════════════════════════════════════════════════
 async def step_photo_type(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     q = update.callback_query
@@ -179,7 +196,7 @@ async def step_photo_type(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int
         )
         return PAIR
 
-    # After: fetch open trades
+    # ── After flow ────────────────────────────────────────────────────────────
     await q.edit_message_text("⏳ Fetching open trades…")
     try:
         open_trades = notion.query_open_trades()
@@ -208,6 +225,10 @@ async def step_photo_type(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int
         parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons),
     )
     return PICK_TRADE
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BEFORE FLOW  (B1 → B8)
+# ══════════════════════════════════════════════════════════════════════════════
 
 # B1 ── Pair ───────────────────────────────────────────────────────────────────
 async def step_pair(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -246,7 +267,7 @@ async def step_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 
 # B4 ── Setup multi-select ─────────────────────────────────────────────────────
 async def step_setup_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    q   = update.callback_query
+    q      = update.callback_query
     await q.answer()
     chosen = val(q.data)
 
@@ -263,14 +284,12 @@ async def step_setup_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int
         if not setups:
             await q.answer("Pick at least one setup!", show_alert=True)
             return SETUP_PICK
-
         await q.edit_message_text(
             f"{summary(ctx.user_data)}\n\n*How are you feeling?*",
             parse_mode="Markdown", reply_markup=kb(EMOTIONS, "emotion"),
         )
         return EMOTION
 
-    # Toggle selection
     setups = ctx.user_data.setdefault("setups", [])
     if chosen in setups:
         setups.remove(chosen)
@@ -298,7 +317,7 @@ async def step_custom_setup(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> i
     if name not in setups:
         setups.append(name)
 
-    msg = await update.message.reply_text(
+    await update.message.reply_text(
         f"✅ *{name}* saved — appears as button next time!\n\n"
         f"{summary(ctx.user_data)}\n\n"
         f"*Setup / Strategy?*\n_Tap all that apply, then ✅ Done_",
@@ -317,12 +336,25 @@ async def step_emotion(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     )
     return GRADE
 
-# B6 ── Grade ──────────────────────────────────────────────────────────────────
+# B6 ── Grade → trigger chart reading ─────────────────────────────────────────
 async def step_grade(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     q = update.callback_query
     await q.answer()
     raw = val(q.data)
     ctx.user_data["grade"] = "" if raw == "Skip" else raw[0]
+
+    # ── Auto-detect prices if Anthropic key is configured ─────────────────────
+    if _CHART_READER_AVAILABLE and ctx.user_data.get("photo_bytes"):
+        await q.edit_message_text(
+            f"{summary(ctx.user_data)}\n\n"
+            "🔍 *Analysing chart for Entry / SL / TP…*",
+            parse_mode="Markdown",
+        )
+        levels = cr.extract_levels(ctx.user_data["photo_bytes"])
+        ctx.user_data["detected"] = levels
+        return await _show_confirm_prices(q.message, ctx)
+
+    # ── Fallback: manual entry flow ───────────────────────────────────────────
     await q.edit_message_text(
         f"{summary(ctx.user_data)}\n\n"
         "*Entry price?* (optional)\n\nType e.g. `2340.50` or skip:",
@@ -330,29 +362,146 @@ async def step_grade(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     )
     return ENTRY_PRICE
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CONFIRM_PRICES  (new state — only reached when chart_reader is active)
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def _show_confirm_prices(bot_msg, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    """
+    Render the auto-detected price confirmation screen.
+    Three options:
+      ✅ Use these  — accept and save immediately
+      ✏️ Edit       — enter manual flow (pre-filled with detected values)
+      ⏭️ Skip all   — save with no prices
+    """
+    levels = ctx.user_data.get("detected", {})
+    d      = ctx.user_data
+
+    entry = levels.get("entry")
+    sl    = levels.get("sl")
+    tp    = levels.get("tp")
+    conf  = levels.get("confidence", "low")
+    err   = levels.get("error")
+
+    if err or (entry is None and sl is None and tp is None):
+        # Detection failed — fall back to manual entry silently
+        await bot_msg.edit_text(
+            f"{summary(d)}\n\n"
+            "⚠️ _Could not read prices from chart — please enter manually._\n\n"
+            "*Entry price?* (optional)\n\nType e.g. `2340.50` or skip:",
+            parse_mode="Markdown", reply_markup=skip_kb("entry"),
+        )
+        return ENTRY_PRICE
+
+    conf_emoji = {"high": "🟢", "medium": "🟡", "low": "🔴"}.get(conf, "🔴")
+    conf_label = conf.capitalize()
+
+    detected_lines = (
+        f"Entry: `{_fmt_price(entry)}`\n"
+        f"SL:    `{_fmt_price(sl)}`\n"
+        f"TP:    `{_fmt_price(tp)}`\n"
+        f"{conf_emoji} {conf_label} confidence"
+    )
+
+    kb_confirm = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Use these",  callback_data="prices:use"),
+            InlineKeyboardButton("✏️ Edit",        callback_data="prices:edit"),
+        ],
+        [
+            InlineKeyboardButton("⏭️ Skip prices", callback_data="prices:skip"),
+        ],
+    ])
+
+    await bot_msg.edit_text(
+        f"{summary(d)}\n\n"
+        f"🤖 *Detected from chart:*\n\n"
+        f"{detected_lines}\n\n"
+        f"_Use these prices, edit them, or skip?_",
+        parse_mode="Markdown",
+        reply_markup=kb_confirm,
+    )
+    return CONFIRM_PRICES
+
+
+async def step_confirm_prices(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle the ✅ / ✏️ / ⏭️ choice on the confirm-prices screen."""
+    q = update.callback_query
+    await q.answer()
+    choice = val(q.data)           # "use" | "edit" | "skip"
+
+    levels = ctx.user_data.get("detected", {})
+
+    if choice == "use":
+        # Accept detected values, save to Notion immediately
+        ctx.user_data["entry"] = levels.get("entry")
+        ctx.user_data["sl"]    = levels.get("sl")
+        ctx.user_data["tp"]    = levels.get("tp")
+        await q.edit_message_text("⏳ Saving to Notion…")
+        await _log_before(q.message, ctx)
+        return ConversationHandler.END
+
+    if choice == "skip":
+        # No prices at all
+        ctx.user_data["entry"] = None
+        ctx.user_data["sl"]    = None
+        ctx.user_data["tp"]    = None
+        await q.edit_message_text("⏳ Saving to Notion…")
+        await _log_before(q.message, ctx)
+        return ConversationHandler.END
+
+    # "edit" — pre-fill user_data with detected values and enter manual flow
+    ctx.user_data["entry"] = levels.get("entry")
+    ctx.user_data["sl"]    = levels.get("sl")
+    ctx.user_data["tp"]    = levels.get("tp")
+
+    entry_display = _fmt_price(ctx.user_data["entry"])
+    hint = f"Detected: `{entry_display}`  — type to override or skip:" if ctx.user_data["entry"] else "Type e.g. `2340.50` or skip:"
+
+    await q.edit_message_text(
+        f"{summary(ctx.user_data)}\n\n"
+        f"*Entry price?* (optional)\n\n{hint}",
+        parse_mode="Markdown", reply_markup=skip_kb("entry"),
+    )
+    return ENTRY_PRICE
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MANUAL PRICE ENTRY  (B7 / B8 / B9)
+# ══════════════════════════════════════════════════════════════════════════════
+
 # B7 ── Entry price ────────────────────────────────────────────────────────────
 async def step_entry_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     try:
-        ctx.user_data["entry"] = float(update.message.text.strip().replace(",", ".").split()[0])
+        ctx.user_data["entry"] = float(
+            update.message.text.strip().replace(",", ".").split()[0]
+        )
     except ValueError:
         await update.message.reply_text(
             "❌ Not a valid number. Try `2340.50` or tap Skip.",
             parse_mode="Markdown", reply_markup=skip_kb("entry"),
         )
         return ENTRY_PRICE
-    bot_msg = await update.message.reply_text(
-        f"Entry: `{ctx.user_data['entry']}`\n\n*Stop Loss (SL)?* (optional)\n\nType e.g. `2320.00` or skip:",
+
+    sl_hint = _pre_filled_hint("sl", ctx)
+    await update.message.reply_text(
+        f"Entry: `{_fmt_price(ctx.user_data['entry'])}`\n\n"
+        f"*Stop Loss (SL)?* (optional)\n\n{sl_hint}",
         parse_mode="Markdown", reply_markup=skip_kb("sl"),
     )
-    ctx.user_data["_bot_msg"] = bot_msg
     return SL_PRICE
 
 async def step_entry_skip(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     q = update.callback_query
     await q.answer()
-    ctx.user_data["entry"] = None
+    # Keep any pre-filled value or set None
+    if "entry" not in ctx.user_data:
+        ctx.user_data["entry"] = None
+
+    sl_hint = _pre_filled_hint("sl", ctx)
     await q.edit_message_text(
-        "*Stop Loss (SL)?* (optional)\n\nType e.g. `2320.00` or skip:",
+        f"*Stop Loss (SL)?* (optional)\n\n{sl_hint}",
         parse_mode="Markdown", reply_markup=skip_kb("sl"),
     )
     return SL_PRICE
@@ -360,15 +509,20 @@ async def step_entry_skip(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int
 # B8 ── SL ─────────────────────────────────────────────────────────────────────
 async def step_sl_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     try:
-        ctx.user_data["sl"] = float(update.message.text.strip().replace(",", ".").split()[0])
+        ctx.user_data["sl"] = float(
+            update.message.text.strip().replace(",", ".").split()[0]
+        )
     except ValueError:
         await update.message.reply_text(
             "❌ Not valid. Try `2320.00` or tap Skip.",
             parse_mode="Markdown", reply_markup=skip_kb("sl"),
         )
         return SL_PRICE
+
+    tp_hint = _pre_filled_hint("tp", ctx)
     await update.message.reply_text(
-        f"SL: `{ctx.user_data['sl']}`\n\n*Take Profit (TP)?* (optional)\n\nType e.g. `2380.00` or skip:",
+        f"SL: `{_fmt_price(ctx.user_data['sl'])}`\n\n"
+        f"*Take Profit (TP)?* (optional)\n\n{tp_hint}",
         parse_mode="Markdown", reply_markup=skip_kb("tp"),
     )
     return TP_PRICE
@@ -376,9 +530,12 @@ async def step_sl_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 async def step_sl_skip(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     q = update.callback_query
     await q.answer()
-    ctx.user_data["sl"] = None
+    if "sl" not in ctx.user_data:
+        ctx.user_data["sl"] = None
+
+    tp_hint = _pre_filled_hint("tp", ctx)
     await q.edit_message_text(
-        "*Take Profit (TP)?* (optional)\n\nType e.g. `2380.00` or skip:",
+        f"*Take Profit (TP)?* (optional)\n\n{tp_hint}",
         parse_mode="Markdown", reply_markup=skip_kb("tp"),
     )
     return TP_PRICE
@@ -386,7 +543,9 @@ async def step_sl_skip(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 # B9 ── TP → log to Notion ─────────────────────────────────────────────────────
 async def step_tp_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     try:
-        ctx.user_data["tp"] = float(update.message.text.strip().replace(",", ".").split()[0])
+        ctx.user_data["tp"] = float(
+            update.message.text.strip().replace(",", ".").split()[0]
+        )
     except ValueError:
         await update.message.reply_text(
             "❌ Not valid. Try `2380.00` or tap Skip.",
@@ -400,10 +559,24 @@ async def step_tp_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 async def step_tp_skip(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     q = update.callback_query
     await q.answer()
-    ctx.user_data["tp"] = None
+    if "tp" not in ctx.user_data:
+        ctx.user_data["tp"] = None
     await q.edit_message_text("⏳ Saving to Notion…")
     await _log_before(q.message, ctx)
     return ConversationHandler.END
+
+
+def _pre_filled_hint(field: str, ctx: ContextTypes.DEFAULT_TYPE) -> str:
+    """
+    When the user chose ✏️ Edit, show the detected value as a hint
+    so they know what was pre-detected and can just tap Skip to accept it.
+    """
+    v = ctx.user_data.get(field)
+    if v is not None:
+        label = field.upper()
+        return f"Detected {label}: `{_fmt_price(v)}` — type to override or skip to accept:"
+    return f"Type e.g. `{'2320.00' if field == 'sl' else '2380.00'}` or skip:"
+
 
 # ── Before → Notion ───────────────────────────────────────────────────────────
 async def _log_before(bot_msg, ctx: ContextTypes.DEFAULT_TYPE):
@@ -425,17 +598,23 @@ async def _log_before(bot_msg, ctx: ContextTypes.DEFAULT_TYPE):
         if risk > 0:
             rr_str = f"{reward / risk:.2f}R"
 
+    # Source tag for prices
+    auto_tag = ""
+    if d.get("detected") and (entry or sl or tp):
+        conf = d["detected"].get("confidence", "")
+        auto_tag = f"\n_🤖 Prices auto-detected ({conf} confidence)_"
+
     try:
-        page     = notion.create_open_trade(
-            symbol    = d.get("symbol", ""),
-            direction = d.get("dir", ""),
-            session   = d.get("session", ""),
-            setups    = d.get("setups", []),
-            emotion   = d.get("emotion", ""),
-            grade     = d.get("grade", ""),
-            entry     = entry,
-            sl        = sl,
-            tp        = tp,
+        page = notion.create_open_trade(
+            symbol           = d.get("symbol", ""),
+            direction        = d.get("dir", ""),
+            session          = d.get("session", ""),
+            setups           = d.get("setups", []),
+            emotion          = d.get("emotion", ""),
+            grade            = d.get("grade", ""),
+            entry            = entry,
+            sl               = sl,
+            tp               = tp,
             before_image_url = image_url,
         )
         page_url   = page.get("url", "")
@@ -447,8 +626,9 @@ async def _log_before(bot_msg, ctx: ContextTypes.DEFAULT_TYPE):
             f"Session: {d.get('session','')}  |  Setup: {setups_str}\n"
             f"Emotion: {d.get('emotion','')}"
             f"{'  |  Grade: ' + d.get('grade','') if d.get('grade') else ''}\n\n"
-            f"Entry: `{entry or '—'}`  |  SL: `{sl or '—'}`  |  TP: `{tp or '—'}`\n"
-            f"Planned R:R: `{rr_str}`\n\n"
+            f"Entry: `{_fmt_price(entry)}`  |  SL: `{_fmt_price(sl)}`  |  TP: `{_fmt_price(tp)}`\n"
+            f"Planned R:R: `{rr_str}`"
+            f"{auto_tag}\n\n"
             f"{screenshot}\n"
             f"✅ [Trade opened in Notion]({page_url})\n\n"
             f"_Send After chart when trade closes._",
@@ -456,10 +636,13 @@ async def _log_before(bot_msg, ctx: ContextTypes.DEFAULT_TYPE):
         )
     except Exception as e:
         log.exception("_log_before error")
-        try: await bot_msg.edit_text(f"❌ Error: {e}")
-        except Exception: pass
+        try:
+            await bot_msg.edit_text(f"❌ Error: {e}")
+        except Exception:
+            pass
     finally:
         ctx.user_data.clear()
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # AFTER FLOW
@@ -478,7 +661,9 @@ async def step_pick_trade(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int
     await q.edit_message_text(
         f"*{t.get('symbol','')} {t.get('dir','')}*  opened {t.get('date','')}\n"
         f"Setup: {setup_str}\n"
-        f"Entry: `{t.get('entry','—')}`  |  SL: `{t.get('sl','—')}`  |  TP: `{t.get('tp','—')}`\n\n"
+        f"Entry: `{_fmt_price(t.get('entry'))}`  "
+        f"|  SL: `{_fmt_price(t.get('sl'))}`  "
+        f"|  TP: `{_fmt_price(t.get('tp'))}`\n\n"
         f"*Result?*\n\n"
         f"_Exit will be auto-filled:_\n"
         f"Win → TP  |  Loss → SL  |  BE → Entry",
@@ -514,10 +699,8 @@ async def _log_after(bot_msg, ctx: ContextTypes.DEFAULT_TYPE):
     sl    = t.get("sl")
     tp    = t.get("tp")
 
-    # Auto-filled exit
     exit_price = notion.resolve_exit(result, entry, sl, tp)
 
-    # Actual R:R preview
     rr_str = "—"
     if entry and sl and exit_price:
         is_long = t.get("dir", "Long").lower() == "long"
@@ -539,7 +722,7 @@ async def _log_after(bot_msg, ctx: ContextTypes.DEFAULT_TYPE):
 
         await bot_msg.edit_text(
             f"{emoji} *{t.get('symbol','')} {t.get('dir','')} — {result}*\n\n"
-            f"Entry: `{entry or '—'}`  →  Exit ({exit_label}): `{exit_price or '—'}`\n"
+            f"Entry: `{_fmt_price(entry)}`  →  Exit ({exit_label}): `{_fmt_price(exit_price)}`\n"
             f"Actual R:R: `{rr_str}`\n\n"
             f"{screenshot}\n"
             f"✅ Trade closed in Notion",
@@ -547,10 +730,13 @@ async def _log_after(bot_msg, ctx: ContextTypes.DEFAULT_TYPE):
         )
     except Exception as e:
         log.exception("_log_after error")
-        try: await bot_msg.edit_text(f"❌ Error: {e}")
-        except Exception: pass
+        try:
+            await bot_msg.edit_text(f"❌ Error: {e}")
+        except Exception:
+            pass
     finally:
         ctx.user_data.clear()
+
 
 # ── /cancel ───────────────────────────────────────────────────────────────────
 async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -561,11 +747,13 @@ async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 # ── /start ────────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not authorized(update): return
+    auto_tag = "🤖 _Entry/SL/TP auto-detected from chart_\n" if _CHART_READER_AVAILABLE else ""
     await update.message.reply_text(
         "📒 *Trading Journal Bot*\n\n"
         "Drop a chart screenshot to log a trade.\n\n"
         "📊 *Before* — logs entry, setup, SL/TP\n"
         "🏁 *After*  — pick trade, select result → done\n"
+        f"{auto_tag}"
         "_(Exit auto-filled: Win=TP, Loss=SL, BE=Entry)_\n\n"
         "`/stats`   — performance summary\n"
         "`/open`    — list open trades\n"
@@ -608,42 +796,70 @@ async def cmd_open(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         lines = ["📂 *Open trades:*\n"]
         for t in trades:
             setup_str = " + ".join(t.get("setups", [])) or "—"
-            e = f"@ `{t['entry']}`" if t.get("entry") else ""
+            e = f"@ `{_fmt_price(t.get('entry'))}`" if t.get("entry") else ""
             lines.append(
                 f"• *{t['symbol']}* {t['dir']}  {t['date']}  {e}\n"
-                f"  Setup: {setup_str}  |  SL: `{t.get('sl','—')}`  TP: `{t.get('tp','—')}`"
+                f"  Setup: {setup_str}  "
+                f"|  SL: `{_fmt_price(t.get('sl'))}`  "
+                f"TP: `{_fmt_price(t.get('tp'))}`"
             )
         await msg.edit_text("\n".join(lines), parse_mode="Markdown")
     except Exception as e:
         await msg.edit_text(f"❌ Error: {e}")
 
-# ── ConversationHandler ───────────────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ConversationHandler
+# ══════════════════════════════════════════════════════════════════════════════
 def build_conv_handler() -> ConversationHandler:
     return ConversationHandler(
         entry_points=[MessageHandler(filters.PHOTO, receive_photo)],
         states={
-            PHOTO_TYPE:   [CallbackQueryHandler(step_photo_type,   pattern=r"^type:")],
-            PAIR:         [CallbackQueryHandler(step_pair,          pattern=r"^pair:")],
-            DIRECTION:    [CallbackQueryHandler(step_direction,     pattern=r"^dir:")],
-            SESSION:      [CallbackQueryHandler(step_session,       pattern=r"^session:")],
-            SETUP_PICK:   [CallbackQueryHandler(step_setup_pick,    pattern=r"^setup:")],
-            CUSTOM_SETUP: [MessageHandler(filters.TEXT & ~filters.COMMAND, step_custom_setup)],
-            EMOTION:      [CallbackQueryHandler(step_emotion,       pattern=r"^emotion:")],
-            GRADE:        [CallbackQueryHandler(step_grade,         pattern=r"^grade:")],
-            ENTRY_PRICE:  [
+            PHOTO_TYPE: [
+                CallbackQueryHandler(step_photo_type, pattern=r"^type:")
+            ],
+            PAIR: [
+                CallbackQueryHandler(step_pair, pattern=r"^pair:")
+            ],
+            DIRECTION: [
+                CallbackQueryHandler(step_direction, pattern=r"^dir:")
+            ],
+            SESSION: [
+                CallbackQueryHandler(step_session, pattern=r"^session:")
+            ],
+            SETUP_PICK: [
+                CallbackQueryHandler(step_setup_pick, pattern=r"^setup:")
+            ],
+            CUSTOM_SETUP: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, step_custom_setup)
+            ],
+            EMOTION: [
+                CallbackQueryHandler(step_emotion, pattern=r"^emotion:")
+            ],
+            GRADE: [
+                CallbackQueryHandler(step_grade, pattern=r"^grade:")
+            ],
+            CONFIRM_PRICES: [                               # ← NEW
+                CallbackQueryHandler(step_confirm_prices, pattern=r"^prices:")
+            ],
+            ENTRY_PRICE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, step_entry_text),
                 CallbackQueryHandler(step_entry_skip, pattern=r"^entry:skip"),
             ],
-            SL_PRICE:     [
+            SL_PRICE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, step_sl_text),
-                CallbackQueryHandler(step_sl_skip,    pattern=r"^sl:skip"),
+                CallbackQueryHandler(step_sl_skip,   pattern=r"^sl:skip"),
             ],
-            TP_PRICE:     [
+            TP_PRICE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, step_tp_text),
-                CallbackQueryHandler(step_tp_skip,    pattern=r"^tp:skip"),
+                CallbackQueryHandler(step_tp_skip,   pattern=r"^tp:skip"),
             ],
-            PICK_TRADE:   [CallbackQueryHandler(step_pick_trade,   pattern=r"^pick:")],
-            RESULT:       [CallbackQueryHandler(step_result,       pattern=r"^result:")],
+            PICK_TRADE: [
+                CallbackQueryHandler(step_pick_trade, pattern=r"^pick:")
+            ],
+            RESULT: [
+                CallbackQueryHandler(step_result, pattern=r"^result:")
+            ],
         },
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
         per_user=True,
