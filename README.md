@@ -1,13 +1,16 @@
 # Jourding
 
-A Telegram bot that logs your trades into Notion using a screenshot-first, button-driven flow. No typing required — just drop a chart and tap buttons.
+A Telegram bot that logs your trades into Notion using a screenshot-first, button-driven flow. No typing required — drop a chart, tap buttons, done.
+
+> 🤖 **Auto-detects Entry, SL & TP** from your chart screenshot using NVIDIA Nemotron vision (free via OpenRouter) — zero manual price input needed.
 
 ---
 
 ## How it works
 
 ### Before chart (opening a trade)
-Drop your entry chart → bot asks questions via buttons → trade saved to Notion as **Open**
+
+Drop your entry chart → bot reads prices automatically → confirm or edit → trade saved to Notion as **Open**
 
 ```
 📸 Screenshot
@@ -16,13 +19,16 @@ Before / After?
     ↓ Before
 Pair → Direction → Session → Setup (multi-select) → Emotion → Grade
     ↓
-Entry price (optional) → SL (optional) → TP (optional)
+🤖 Auto-detect Entry / SL / TP from chart
+    ↓
+✅ Use detected  |  ✏️ Edit  |  ⏭️ Skip
     ↓
 ✅ Saved to Notion — Status: Open
    Planned R:R calculated automatically by Notion formula
 ```
 
 ### After chart (closing a trade)
+
 Drop your exit chart → pick the open trade → select result → done
 
 ```
@@ -47,12 +53,15 @@ Result: Win / Loss / Break Even
 ```
 Jourding/
 ├── main.py                # Entry point — starts the bot
-├── handlers.py            # All Telegram conversation handlers
+├── handlers.py            # All Telegram conversation handlers (14-state machine)
+├── chart_reader.py        # Vision AI — extracts Entry/SL/TP from chart screenshots
 ├── notion_client.py       # Notion API wrapper
 ├── setup_notion.py        # One-time database creation script
 ├── config.py              # Env loader + validation
+├── parser.py              # Trade data parser and calculator
 ├── custom_setups.json     # Auto-created — saves your custom setups
 ├── requirements.txt
+├── Jourding.service       # systemd service file for VPS deployment
 └── .env                   # Your tokens (copy from .env.example)
 ```
 
@@ -60,7 +69,16 @@ Jourding/
 
 ## Quick start
 
-### 1. Install dependencies
+### 1. Clone and create a virtual environment
+
+```bash
+git clone https://github.com/Maryoux/Jourding.git
+cd Jourding
+python3 -m venv venv
+source venv/bin/activate
+```
+
+### 2. Install dependencies
 
 ```bash
 pip install -r requirements.txt
@@ -68,18 +86,17 @@ pip install -r requirements.txt
 
 `requirements.txt`:
 ```
-python-telegram-bot>=21.0
-requests>=2.31.0
-python-dotenv>=1.0.0
+python-telegram-bot==20.7
+requests==2.31.0
+python-dotenv==1.0.0
 ```
 
-### 2. Set up your `.env`
+### 3. Set up your `.env`
+
 ```bash
 cp .env.example .env
-
 nano .env
 ```
-
 
 ```env
 # Telegram
@@ -93,9 +110,12 @@ NOTION_PARENT_PAGE_ID=           # Optional — page to create the DB inside
 
 # Screenshot hosting (free)
 IMGBB_API_KEY=                   # Get free key at imgbb.com
+
+# Auto chart reading — FREE via OpenRouter (optional but recommended)
+OPENROUTER_API_KEY=              # Get free key at openrouter.ai
 ```
 
-### 3. Get your tokens
+### 4. Get your tokens
 
 **Telegram Bot Token**
 - Open Telegram → search `@BotFather` → `/newbot` → copy token
@@ -111,7 +131,12 @@ IMGBB_API_KEY=                   # Get free key at imgbb.com
 - Register free at https://imgbb.com → API section → copy key
 - Without this, screenshots will **not** be saved to Notion
 
-### 4. Create the Notion database
+**OpenRouter API Key** *(for auto price detection — free)*
+- Sign up at https://openrouter.ai → Keys → Create key → copy it
+- No credit card required — the Nemotron models used are completely free
+- Without this, Entry/SL/TP must be entered manually
+
+### 5. Create the Notion database
 
 ```bash
 python setup_notion.py
@@ -122,11 +147,45 @@ The script will:
 - Create the full database with all properties and formulas
 - Print the `NOTION_DATABASE_ID` → paste it into `.env`
 
-### 5. Run the bot
+### 6. Run the bot
 
 ```bash
 python main.py
 ```
+
+---
+
+## Auto price detection
+
+When `OPENROUTER_API_KEY` is set, after you select a grade the bot automatically analyses the chart screenshot and detects Entry, SL, and TP price levels.
+
+You'll see a confirmation screen with three options:
+
+```
+🤖 Detected from chart:
+
+Entry: `84500.00`
+SL:    `82000.00`
+TP:    `88000.00`
+🟢 High confidence
+
+[ ✅ Use these ]  [ ✏️ Edit ]
+      [ ⏭️ Skip prices ]
+```
+
+| Option | Behaviour |
+|---|---|
+| ✅ Use these | Accept detected values → saves to Notion immediately, no typing |
+| ✏️ Edit | Opens manual entry flow with detected values pre-filled as hints |
+| ⏭️ Skip prices | Saves the trade with no price data |
+
+If detection fails or `OPENROUTER_API_KEY` is not set, the bot silently falls back to the original manual entry flow.
+
+**Models used (both free, $0/M tokens):**
+| Model | Role |
+|---|---|
+| `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free` | Primary — better instruction following |
+| `nvidia/nemotron-nano-12b-v2-vl:free` | Fallback — ChartQA and OCR specialist |
 
 ---
 
@@ -143,9 +202,9 @@ python main.py
 | Session | Select | Bot |
 | Emotion | Select | Bot |
 | Grade | Select | Bot |
-| Entry | Number | Bot |
-| SL | Number | Bot |
-| TP | Number | Bot |
+| Entry | Number | Bot / AI |
+| SL | Number | Bot / AI |
+| TP | Number | Bot / AI |
 | Exit | Number | Bot (auto from result) |
 | Planned R:R | **Formula** | Notion (Entry/SL/TP) |
 | Actual R:R | **Formula** | Notion (Entry/Exit/SL) |
@@ -156,19 +215,19 @@ python main.py
 
 *Planned R:R*
 ```
-if(SL != 0 and Entry != 0 and TP != 0,
-  if(Direction == "Long",
-    (TP - Entry) / (Entry - SL),
-    (Entry - TP) / (SL - Entry)),
+if(prop("SL") != 0 and prop("Entry") != 0 and prop("TP") != 0,
+  if(prop("Direction") == "Long",
+    (prop("TP") - prop("Entry")) / (prop("Entry") - prop("SL")),
+    (prop("Entry") - prop("TP")) / (prop("SL") - prop("Entry"))),
   0)
 ```
 
 *Actual R:R*
 ```
-if(SL != 0 and Entry != 0 and Exit != 0,
-  if(Direction == "Long",
-    (Exit - Entry) / (Entry - SL),
-    (Entry - Exit) / (SL - Entry)),
+if(prop("SL") != 0 and prop("Entry") != 0 and prop("Exit") != 0,
+  if(prop("Direction") == "Long",
+    (prop("Exit") - prop("Entry")) / (prop("Entry") - prop("SL")),
+    (prop("Entry") - prop("Exit")) / (prop("SL") - prop("Entry"))),
   0)
 ```
 
@@ -210,39 +269,75 @@ You can select **multiple setups** per trade to capture confluence.
 
 ---
 
-## Running 24/7
+## Deploying 24/7 on a VPS
 
-### Option A — screen (simplest)
+A $4–6/mo VPS (Hetzner, DigitalOcean, Vultr) running Ubuntu is more than enough — the bot uses almost no RAM or CPU.
+
+### 1. Upload your files
+
 ```bash
-screen -S tradebot
-python main.py
-# Detach: Ctrl+A then D
-# Reattach: screen -r tradebot
+scp -r ./Jourding root@your-vps-ip:/home/Jourding
 ```
 
-### Option B — systemd service (Linux/VPS)
+### 2. Set up the environment on the VPS
+
+```bash
+cd /home/Jourding
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
+
+### 3. Configure your .env
+
+```bash
+cp .env.example .env
+nano .env    # fill in all your tokens
+```
+
+### 4. Install the systemd service
+
+```bash
+sudo cp Jourding.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable Jourding
+sudo systemctl start Jourding
+```
+
+**`Jourding.service`:**
 ```ini
-# /etc/systemd/system/tradebot.service
 [Unit]
-Description=Trading Journal Bot
-After=network.target
+Description=Jourding Trading Journal Bot
+After=network-online.target
+Wants=network-online.target
 
 [Service]
-WorkingDirectory=/path/to/Jourding
-ExecStart=/usr/bin/python3 main.py
+Type=simple
+User=root
+WorkingDirectory=/home/Jourding
+ExecStartPre=/bin/sleep 10
+ExecStart=/home/Jourding/venv/bin/python3 /home/Jourding/main.py
 Restart=always
-EnvironmentFile=/path/to/Jourding/.env
+RestartSec=10
+EnvironmentFile=/home/Jourding/.env
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=jourding
 
 [Install]
 WantedBy=multi-user.target
 ```
-```bash
-sudo systemctl enable tradebot
-sudo systemctl start tradebot
-sudo journalctl -u tradebot -f    # watch logs
-```
 
-A $4–6/mo VPS (Hetzner, DigitalOcean, Vultr) running Ubuntu is enough — the bot uses almost no RAM or CPU.
+> `ExecStartPre=/bin/sleep 10` gives the network a moment to fully stabilise after boot before the bot tries to connect to Telegram — prevents `NetworkError` on startup.
+
+### 5. Useful commands
+
+```bash
+sudo systemctl status Jourding       # check running status
+sudo journalctl -u Jourding -f       # live log stream
+sudo systemctl restart Jourding      # restart after code changes
+sudo systemctl stop Jourding         # stop the bot
+```
 
 ---
 
@@ -260,6 +355,17 @@ A $4–6/mo VPS (Hetzner, DigitalOcean, Vultr) running Ubuntu is enough — the 
 **Screenshots not appearing in Notion**
 - Set `IMGBB_API_KEY` in `.env` — without it screenshots are skipped
 - Free key at https://imgbb.com, takes 1 minute to get
+
+**Auto price detection not working / falls back to manual**
+- Make sure `OPENROUTER_API_KEY` is set in `.env`
+- Check the logs: `journalctl -u Jourding -f` — look for `chart_reader` lines
+- Free models can occasionally be rate-limited; the bot automatically retries with the fallback model
+- If both models are unavailable, the bot falls back to manual entry gracefully
+
+**`NetworkError: httpx.ReadError` on startup (systemd)**
+- This happens when the service starts before the network is fully ready
+- The `ExecStartPre=/bin/sleep 10` in the service file fixes this
+- If it persists after reboots, increase the sleep value to `20`
 
 **Open trades not showing in After flow**
 - Make sure the trade was logged with `Status: Open` — only trades created by this bot appear
